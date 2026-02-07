@@ -1,8 +1,10 @@
 import { FunctionHandler } from "./types";
 import { exec } from "child_process";
 import { promisify } from "util";
+import YahooFinance from "yahoo-finance2";
 
 const execAsync = promisify(exec);
+const yf = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
 const BRAVE_API_KEY = "BSAFD6RDnW2X_MfRtzwEKUYjzvY9URt";
 const OPENCLAW_TOKEN = "014f8943579c8d8e5dc5d26a501e2b213845b957bc16058f";
 const OPENCLAW_PORT = 18789;
@@ -204,20 +206,65 @@ functions.push({
   },
 });
 
-// ─── Stock Portfolio Quick Check ───
+// ─── Stock Quote (yahoo-finance2) ───
 functions.push({
   schema: {
-    name: "check_stocks",
+    name: "stock_quote",
     type: "function",
     description:
-      "Get a quick stock price or portfolio update. Can check individual tickers or give a general market overview.",
+      "Get real-time stock price, change, market cap, and key stats for any ticker. Use this when asked about a specific stock's current price or performance.",
+    parameters: {
+      type: "object",
+      properties: {
+        ticker: {
+          type: "string",
+          description:
+            "Stock ticker symbol (e.g. AAPL, TSLA, GLEN.L for London-listed)",
+        },
+      },
+      required: ["ticker"],
+    },
+  },
+  handler: async (args: { ticker: string }) => {
+    try {
+      const quote = await yf.quote(args.ticker);
+      if (!quote) return JSON.stringify({ error: "No data found" });
+      return JSON.stringify({
+        symbol: quote.symbol,
+        name: quote.shortName || quote.longName,
+        price: quote.regularMarketPrice,
+        currency: quote.currency,
+        change: quote.regularMarketChange,
+        changePercent: quote.regularMarketChangePercent,
+        dayHigh: quote.regularMarketDayHigh,
+        dayLow: quote.regularMarketDayLow,
+        fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,
+        fiftyTwoWeekLow: quote.fiftyTwoWeekLow,
+        marketCap: quote.marketCap,
+        marketState: quote.marketState,
+        fiftyDayAvg: quote.fiftyDayAverage,
+        twoHundredDayAvg: quote.twoHundredDayAverage,
+      });
+    } catch (err: any) {
+      return JSON.stringify({ error: err.message });
+    }
+  },
+});
+
+// ─── Stock News (yahoo-finance2 search) ───
+functions.push({
+  schema: {
+    name: "stock_news",
+    type: "function",
+    description:
+      "Get the latest news for a stock or financial topic. Returns recent headlines from Yahoo Finance.",
     parameters: {
       type: "object",
       properties: {
         query: {
           type: "string",
           description:
-            "Stock ticker (e.g. AAPL), or 'market' for general overview",
+            "Stock ticker or topic to search (e.g. AAPL, 'UK interest rates', 'oil prices')",
         },
       },
       required: ["query"],
@@ -225,19 +272,164 @@ functions.push({
   },
   handler: async (args: { query: string }) => {
     try {
-      const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(args.query + " stock price today")}&count=3`;
-      const response = await fetch(url, {
-        headers: {
-          Accept: "application/json",
-          "Accept-Encoding": "gzip",
-          "X-Subscription-Token": BRAVE_API_KEY,
+      const results = await yf.search(args.query, { newsCount: 8, quotesCount: 0 });
+      const news = (results.news || []).slice(0, 8).map((n: any) => ({
+        title: n.title,
+        publisher: n.publisher,
+        date: n.providerPublishTime,
+        link: n.link,
+      }));
+      return JSON.stringify({ news });
+    } catch (err: any) {
+      return JSON.stringify({ error: err.message });
+    }
+  },
+});
+
+// ─── Stock Insights (analyst recommendations + significant developments) ───
+functions.push({
+  schema: {
+    name: "stock_insights",
+    type: "function",
+    description:
+      "Get analyst recommendations, target prices, significant developments, and research reports for a stock. Great for investment research.",
+    parameters: {
+      type: "object",
+      properties: {
+        ticker: {
+          type: "string",
+          description: "Stock ticker symbol (e.g. AAPL, TSLA)",
         },
-      });
-      const data = await response.json();
-      const results = (data.web?.results || [])
-        .slice(0, 3)
-        .map((r: any) => `${r.title}: ${r.description || ""}`);
-      return JSON.stringify({ results });
+      },
+      required: ["ticker"],
+    },
+  },
+  handler: async (args: { ticker: string }) => {
+    try {
+      const data = await yf.insights(args.ticker, { reportsCount: 3 });
+      const result: any = { symbol: data.symbol };
+
+      if (data.recommendation) {
+        result.recommendation = data.recommendation;
+      }
+      if (data.instrumentInfo?.technicalEvents) {
+        const te = data.instrumentInfo.technicalEvents;
+        result.technicalOutlook = {
+          shortTerm: te.shortTermOutlook?.direction,
+          mediumTerm: te.intermediateTermOutlook?.direction,
+          longTerm: te.longTermOutlook?.direction,
+        };
+      }
+      if (data.instrumentInfo?.valuation) {
+        result.valuation = data.instrumentInfo.valuation.description;
+      }
+      if (data.sigDevs?.length) {
+        result.significantDevelopments = data.sigDevs.slice(0, 5).map((d: any) => ({
+          headline: d.headline,
+          date: d.date,
+        }));
+      }
+      if (data.reports?.length) {
+        result.reports = data.reports.slice(0, 3).map((r: any) => ({
+          title: r.reportTitle,
+          provider: r.provider,
+          date: r.reportDate,
+          rating: r.investmentRating,
+          targetPrice: r.targetPrice,
+        }));
+      }
+      return JSON.stringify(result);
+    } catch (err: any) {
+      return JSON.stringify({ error: err.message });
+    }
+  },
+});
+
+// ─── Market Overview (major indices) ───
+functions.push({
+  schema: {
+    name: "market_overview",
+    type: "function",
+    description:
+      "Get an overview of major market indices (S&P 500, FTSE 100, Nasdaq, etc.). Use when asked about 'the market' or 'how markets are doing'.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  handler: async () => {
+    try {
+      const indices = ["^GSPC", "^IXIC", "^FTSE", "^GDAXI", "^N225"];
+      const names: Record<string, string> = {
+        "^GSPC": "S&P 500",
+        "^IXIC": "Nasdaq",
+        "^FTSE": "FTSE 100",
+        "^GDAXI": "DAX",
+        "^N225": "Nikkei 225",
+      };
+      const results = await Promise.all(
+        indices.map(async (idx) => {
+          try {
+            const q = await yf.quote(idx);
+            return {
+              name: names[idx],
+              price: q?.regularMarketPrice,
+              change: q?.regularMarketChange,
+              changePercent: q?.regularMarketChangePercent,
+              state: q?.marketState,
+            };
+          } catch {
+            return { name: names[idx], error: "unavailable" };
+          }
+        })
+      );
+      return JSON.stringify({ indices: results });
+    } catch (err: any) {
+      return JSON.stringify({ error: err.message });
+    }
+  },
+});
+
+// ─── Trending Tickers ───
+functions.push({
+  schema: {
+    name: "trending_stocks",
+    type: "function",
+    description:
+      "Get currently trending stock tickers on Yahoo Finance. Shows what's popular and being watched.",
+    parameters: {
+      type: "object",
+      properties: {
+        region: {
+          type: "string",
+          description: "Region code (US, GB, DE). Default: US",
+        },
+      },
+      required: [],
+    },
+  },
+  handler: async (args: { region?: string }) => {
+    try {
+      const data = await yf.trendingSymbols(args.region || "US", { count: 10 });
+      const symbols = (data.quotes || []).map((q: any) => q.symbol);
+      // Fetch quotes for trending symbols
+      const quotes = await Promise.all(
+        symbols.slice(0, 8).map(async (s: string) => {
+          try {
+            const q = await yf.quote(s);
+            return {
+              symbol: s,
+              name: q?.shortName,
+              price: q?.regularMarketPrice,
+              changePercent: q?.regularMarketChangePercent,
+            };
+          } catch {
+            return { symbol: s };
+          }
+        })
+      );
+      return JSON.stringify({ trending: quotes });
     } catch (err: any) {
       return JSON.stringify({ error: err.message });
     }
